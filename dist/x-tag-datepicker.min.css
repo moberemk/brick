@@ -1,4 +1,4 @@
-x-datepicker{position:relative;display:inline-block;overflow:visible !important;font-family:"_OpenSansBrick","Segoe UI",Frutiger,"Frutiger Linotype","Dejavu Sans","Helvetica Neue",Arial,sans-serif;}
+x-datepicker{position:relative;display:inline-block;overflow:visible !important;font-family:"_OpenSansBrick","Fira Sans","Segoe UI",Frutiger,"Frutiger Linotype","Dejavu Sans","Helvetica Neue",Arial,sans-serif;}
 x-datepicker > .x-datepicker-input{width:100%;height:100%;-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;margin:0;border:0 solid transparent;vertical-align:top;font:inherit}
 x-datepicker > .x-datepicker-polyfill-input{width:100%;height:100%;-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;position:relative;margin:0;padding:.25em;border:0 solid transparent;vertical-align:top;font:inherit}
 x-datepicker > .x-datepicker-polyfill-ui{position:absolute;left:0;top:100%;margin-top:-1px;min-width:100%;max-width:none;z-index:2147483647}
