@@ -92,38 +92,8 @@ if (typeof WeakMap === "undefined") {
     })();
 }
 
-var SideTable;
-
-if (typeof WeakMap !== "undefined" && navigator.userAgent.indexOf("Firefox/") < 0) {
-    SideTable = WeakMap;
-} else {
-    (function() {
-        var defineProperty = Object.defineProperty;
-        var counter = Date.now() % 1e9;
-        SideTable = function() {
-            this.name = "__st" + (Math.random() * 1e9 >>> 0) + (counter++ + "__");
-        };
-        SideTable.prototype = {
-            set: function(key, value) {
-                var entry = key[this.name];
-                if (entry && entry[0] === key) entry[1] = value; else defineProperty(key, this.name, {
-                    value: [ key, value ],
-                    writable: true
-                });
-            },
-            get: function(key) {
-                var entry;
-                return (entry = key[this.name]) && entry[0] === key ? entry[1] : undefined;
-            },
-            "delete": function(key) {
-                this.set(key, undefined);
-            }
-        };
-    })();
-}
-
 (function(global) {
-    var registrationsTable = new SideTable();
+    var registrationsTable = new WeakMap();
     var setImmediate = window.msSetImmediate;
     if (!setImmediate) {
         var setImmediateQueue = [];
@@ -415,14 +385,9 @@ if (typeof WeakMap !== "undefined" && navigator.userAgent.indexOf("Firefox/") < 
         }
     };
     global.JsMutationObserver = JsMutationObserver;
+    if (!global.MutationObserver && global.WebKitMutationObserver) global.MutationObserver = global.WebKitMutationObserver;
+    if (!global.MutationObserver) global.MutationObserver = JsMutationObserver;
 })(this);
-
-if (!window.MutationObserver) {
-    window.MutationObserver = window.WebKitMutationObserver || window.JsMutationObserver;
-    if (!MutationObserver) {
-        throw new Error("no mutation observer support");
-    }
-}
 
 (function(scope) {
     if (!scope) {
@@ -453,16 +418,19 @@ if (!window.MutationObserver) {
             if (name.indexOf("-") < 0) {
                 throw new Error("document.register: first argument ('name') must contain a dash ('-'). Argument provided was '" + String(name) + "'.");
             }
-            definition.name = name;
+            if (getRegisteredDefinition(name)) {
+                throw new Error("DuplicateDefinitionError: a type with name '" + String(name) + "' is already registered");
+            }
             if (!definition.prototype) {
                 throw new Error("Options missing required prototype property");
             }
+            definition.name = name.toLowerCase();
             definition.lifecycle = definition.lifecycle || {};
             definition.ancestry = ancestry(definition.extends);
             resolveTagName(definition);
             resolvePrototypeChain(definition);
             overrideAttributeApi(definition.prototype);
-            registerDefinition(name, definition);
+            registerDefinition(definition.name, definition);
             definition.ctor = generateConstructor(definition);
             definition.ctor.prototype = definition.prototype;
             definition.prototype.constructor = definition.ctor;
@@ -472,7 +440,7 @@ if (!window.MutationObserver) {
             return definition.ctor;
         }
         function ancestry(extnds) {
-            var extendee = registry[extnds];
+            var extendee = getRegisteredDefinition(extnds);
             if (extendee) {
                 return ancestry(extendee.extends).concat([ extendee ]);
             }
@@ -511,6 +479,7 @@ if (!window.MutationObserver) {
             if (definition.is) {
                 element.setAttribute("is", definition.is);
             }
+            element.removeAttribute("unresolved");
             implement(element, definition);
             element.__upgraded__ = true;
             scope.upgradeSubtree(element);
@@ -545,23 +514,33 @@ if (!window.MutationObserver) {
             }
         }
         function overrideAttributeApi(prototype) {
+            if (prototype.setAttribute._polyfilled) {
+                return;
+            }
             var setAttribute = prototype.setAttribute;
             prototype.setAttribute = function(name, value) {
                 changeAttribute.call(this, name, value, setAttribute);
             };
             var removeAttribute = prototype.removeAttribute;
-            prototype.removeAttribute = function(name, value) {
-                changeAttribute.call(this, name, value, removeAttribute);
+            prototype.removeAttribute = function(name) {
+                changeAttribute.call(this, name, null, removeAttribute);
             };
+            prototype.setAttribute._polyfilled = true;
         }
         function changeAttribute(name, value, operation) {
             var oldValue = this.getAttribute(name);
             operation.apply(this, arguments);
-            if (this.attributeChangedCallback && this.getAttribute(name) !== oldValue) {
-                this.attributeChangedCallback(name, oldValue);
+            var newValue = this.getAttribute(name);
+            if (this.attributeChangedCallback && newValue !== oldValue) {
+                this.attributeChangedCallback(name, oldValue, newValue);
             }
         }
         var registry = {};
+        function getRegisteredDefinition(name) {
+            if (name) {
+                return registry[name.toLowerCase()];
+            }
+        }
         function registerDefinition(name, definition) {
             registry[name] = definition;
         }
@@ -571,7 +550,7 @@ if (!window.MutationObserver) {
             };
         }
         function createElement(tag, typeExtension) {
-            var definition = registry[typeExtension || tag];
+            var definition = getRegisteredDefinition(typeExtension || tag);
             if (definition) {
                 return new definition.ctor();
             }
@@ -580,7 +559,7 @@ if (!window.MutationObserver) {
         function upgradeElement(element) {
             if (!element.__upgraded__ && element.nodeType === Node.ELEMENT_NODE) {
                 var type = element.getAttribute("is") || element.localName;
-                var definition = registry[type];
+                var definition = getRegisteredDefinition(type);
                 return definition && upgrade(element, definition);
             }
         }
@@ -734,7 +713,7 @@ if (!window.MutationObserver) {
             _removed(element);
         }
     }
-    function removed(element) {
+    function _removed(element) {
         if (element.leftViewCallback || element.__upgraded__ && logFlags.dom) {
             logFlags.dom && console.log("removed:", element.localName);
             if (!inDocument(element)) {
@@ -776,15 +755,6 @@ if (!window.MutationObserver) {
             root.__watched = true;
         }
     }
-    function filter(inNode) {
-        switch (inNode.localName) {
-          case "style":
-          case "script":
-          case "template":
-          case undefined:
-            return true;
-        }
-    }
     function handler(mutations) {
         if (logFlags.dom) {
             var mx = mutations[0];
@@ -803,13 +773,13 @@ if (!window.MutationObserver) {
         mutations.forEach(function(mx) {
             if (mx.type === "childList") {
                 forEach(mx.addedNodes, function(n) {
-                    if (filter(n)) {
+                    if (!n.localName) {
                         return;
                     }
                     addedNode(n);
                 });
                 forEach(mx.removedNodes, function(n) {
-                    if (filter(n)) {
+                    if (!n.localName) {
                         return;
                     }
                     removedNode(n);
@@ -882,7 +852,7 @@ if (!window.MutationObserver) {
     CustomElements.parser = parser;
 })();
 
-(function() {
+(function(scope) {
     function bootstrap() {
         CustomElements.parser.parse(document);
         CustomElements.upgradeDocument(document);
@@ -905,13 +875,15 @@ if (!window.MutationObserver) {
             return e;
         };
     }
-    if (document.readyState === "complete") {
+    if (document.readyState === "complete" || scope.flags.eager) {
+        bootstrap();
+    } else if (document.readyState === "interactive" && !window.attachEvent && (!window.HTMLImports || window.HTMLImports.ready)) {
         bootstrap();
     } else {
         var loadEvent = window.HTMLImports ? "HTMLImportsLoaded" : "DOMContentLoaded";
         window.addEventListener(loadEvent, bootstrap);
     }
-})();
+})(window.CustomElements);
 
 (function() {
     var win = window, doc = document, noop = function() {}, trueop = function() {
@@ -980,8 +952,10 @@ if (!window.MutationObserver) {
         return source;
     }
     function wrapMixin(tag, key, pseudo, value, original) {
-        if (typeof original[key] != "function") original[key] = value; else {
-            original[key] = xtag.wrap(original[key], xtag.applyPseudos(pseudo, value, tag.pseudos));
+        var fn = original[key];
+        if (!(key in original)) original[key] = value; else if (typeof original[key] == "function") {
+            if (!fn.__mixins__) fn.__mixins__ = [];
+            fn.__mixins__.push(xtag.applyPseudos(pseudo, value, tag.pseudos));
         }
     }
     var uniqueMixinCount = 0;
@@ -994,7 +968,7 @@ if (!window.MutationObserver) {
             }
         } else {
             for (var zz in mixin) {
-                wrapMixin(tag, zz + ":__mixin__(" + uniqueMixinCount++ + ")", zz, mixin[zz], original);
+                original[zz + ":__mixin__(" + uniqueMixinCount++ + ")"] = xtag.applyPseudos(zz, mixin[zz], tag.pseudos);
             }
         }
     }
@@ -1022,6 +996,7 @@ if (!window.MutationObserver) {
     }
     function delegateAction(pseudo, event) {
         var match, target = event.target;
+        if (!target.tagName) return null;
         if (xtag.matchSelector(target, pseudo.value)) match = target; else if (xtag.matchSelector(target, pseudo.value + " *")) {
             var parent = target.parentNode;
             while (!match) {
@@ -1089,7 +1064,7 @@ if (!window.MutationObserver) {
         var key = z.split(":"), type = key[0];
         if (type == "get") {
             key[0] = prop;
-            tag.prototype[prop].get = xtag.applyPseudos(key.join(":"), accessor[z], tag.pseudos);
+            tag.prototype[prop].get = xtag.applyPseudos(key.join(":"), accessor[z], tag.pseudos, accessor[z]);
         } else if (type == "set") {
             key[0] = prop;
             var setter = tag.prototype[prop].set = xtag.applyPseudos(key.join(":"), attr ? function(value) {
@@ -1102,7 +1077,7 @@ if (!window.MutationObserver) {
             } : accessor[z] ? function(value) {
                 accessor[z].call(this, value);
                 updateView(this, name, value);
-            } : null, tag.pseudos);
+            } : null, tag.pseudos, accessor[z]);
             if (attr) attr.setter = setter;
         } else tag.prototype[prop][z] = accessor[z];
     }
@@ -1166,9 +1141,9 @@ if (!window.MutationObserver) {
             delete options.prototype;
             var tag = xtag.tags[_name] = applyMixins(xtag.merge({}, xtag.defaultOptions, options));
             for (var z in tag.events) tag.events[z] = xtag.parseEvent(z, tag.events[z]);
-            for (z in tag.lifecycle) tag.lifecycle[z.split(":")[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos);
+            for (z in tag.lifecycle) tag.lifecycle[z.split(":")[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos, tag.lifecycle[z]);
             for (z in tag.methods) tag.prototype[z.split(":")[0]] = {
-                value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos),
+                value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos, tag.methods[z]),
                 enumerable: true
             };
             for (z in tag.accessors) parseAccessor(tag, z);
@@ -1181,7 +1156,7 @@ if (!window.MutationObserver) {
                     tag.mixins.forEach(function(mixin) {
                         if (xtag.mixins[mixin].events) xtag.addEvents(element, xtag.mixins[mixin].events);
                     });
-                    var output = ready ? ready.apply(this, toArray(arguments)) : null;
+                    var output = ready ? ready.apply(this, arguments) : null;
                     for (var name in tag.attributes) {
                         var attr = tag.attributes[name], hasAttr = this.hasAttribute(name);
                         if (hasAttr || attr.boolean) {
@@ -1198,7 +1173,7 @@ if (!window.MutationObserver) {
                 value: tag.lifecycle.inserted,
                 enumerable: true
             };
-            if (tag.lifecycle.removed) tag.prototype.leftDocumentCallback = {
+            if (tag.lifecycle.removed) tag.prototype.leftViewCallback = {
                 value: tag.lifecycle.removed,
                 enumerable: true
             };
@@ -1350,6 +1325,32 @@ if (!window.MutationObserver) {
         },
         pseudos: {
             __mixin__: {},
+            mixins: {
+                onCompiled: function(fn, pseudo) {
+                    var mixins = pseudo.source.__mixins__;
+                    if (mixins) switch (pseudo.value) {
+                      case "before":
+                        return function() {
+                            var self = this, args = arguments;
+                            mixins.forEach(function(m) {
+                                m.apply(self, args);
+                            });
+                            return fn.apply(self, args);
+                        };
+
+                      case "after":
+                      case "":
+                        return function() {
+                            var self = this, args = arguments;
+                            returns = fn.apply(self, args);
+                            mixins.forEach(function(m) {
+                                m.apply(self, args);
+                            });
+                            return returns;
+                        };
+                    }
+                }
+            },
             keypass: keypseudo,
             keyfail: keypseudo,
             delegate: {
@@ -1377,7 +1378,7 @@ if (!window.MutationObserver) {
         toArray: toArray,
         wrap: function(original, fn) {
             return function() {
-                var args = toArray(arguments), output = original.apply(this, args);
+                var args = arguments, output = original.apply(this, args);
                 fn.apply(this, args);
                 return output;
             };
@@ -1531,16 +1532,16 @@ if (!window.MutationObserver) {
             var condition = event.condition;
             event.condition = function(e) {
                 var t = e.touches, tt = e.targetTouches;
-                return condition.apply(this, toArray(arguments));
+                return condition.apply(this, arguments);
             };
             var stack = xtag.applyPseudos(event.chain, fn, event._pseudos, event);
             event.stack = function(e) {
                 var t = e.touches, tt = e.targetTouches;
                 var detail = e.detail || {};
-                if (!detail.__stack__) return stack.apply(this, toArray(arguments)); else if (detail.__stack__ == stack) {
+                if (!detail.__stack__) return stack.apply(this, arguments); else if (detail.__stack__ == stack) {
                     e.stopPropagation();
                     e.cancelBubble = true;
-                    return stack.apply(this, toArray(arguments));
+                    return stack.apply(this, arguments);
                 }
             };
             event.listener = function(e) {
@@ -1771,9 +1772,9 @@ if (!window.MutationObserver) {
     xtag.register("x-appbar", {
         lifecycle: {
             created: function() {
-                var header = xtag.queryChildren(this, "header")[0];
+                var header = xtag.queryChildren(this, "h1,h2,h3,h4,h5,h6")[0];
                 if (!header) {
-                    header = document.createElement("header");
+                    header = document.createElement("h1");
                     this.appendChild(header);
                 }
                 this.xtag.data.header = header;
@@ -1910,7 +1911,9 @@ if (!window.MutationObserver) {
     }
     var ISO_DATE_REGEX = /(\d{4})[^\d]?(\d{2})[^\d]?(\d{2})/;
     function fromIso(s) {
-        if (isValidDateObj(s)) return s;
+        if (isValidDateObj(s)) {
+            return s;
+        }
         var d = ISO_DATE_REGEX.exec(s);
         if (d) {
             return normalize(new Date(d[1], d[2] - 1, d[3]));
@@ -1919,7 +1922,9 @@ if (!window.MutationObserver) {
         }
     }
     function parseSingleDate(dateStr) {
-        if (isValidDateObj(dateStr)) return dateStr;
+        if (isValidDateObj(dateStr)) {
+            return dateStr;
+        }
         var isoParsed = fromIso(dateStr);
         if (isoParsed) {
             return isoParsed;
@@ -1941,7 +1946,6 @@ if (!window.MutationObserver) {
             try {
                 ranges = JSON.parse(multiDateStr);
                 if (!isArray(ranges)) {
-                    console.warn("invalid list of ranges", multiDateStr);
                     return null;
                 }
             } catch (err) {
@@ -1949,7 +1953,6 @@ if (!window.MutationObserver) {
                 if (parsedSingle) {
                     return [ parsedSingle ];
                 } else {
-                    console.warn("unable to parse", multiDateStr, "as JSON or single date");
                     return null;
                 }
             }
@@ -1963,37 +1966,38 @@ if (!window.MutationObserver) {
             } else if (typeof range === "string") {
                 var parsedDate = parseSingleDate(range);
                 if (!parsedDate) {
-                    console.warn("unable to parse date", range);
                     return null;
                 }
                 ranges[i] = parsedDate;
             } else if (isArray(range) && range.length === 2) {
                 var parsedStartDate = parseSingleDate(range[0]);
                 if (!parsedStartDate) {
-                    console.warn("unable to parse start date", range[0], "from range", range);
                     return null;
                 }
                 var parsedEndDate = parseSingleDate(range[1]);
                 if (!parsedEndDate) {
-                    console.warn("unable to parse end date", range[1], "from range", range);
                     return null;
                 }
                 if (parsedStartDate.valueOf() > parsedEndDate.valueOf()) {
-                    console.warn("invalid range", range, ": start date is after end date");
                     return null;
                 }
                 ranges[i] = [ parsedStartDate, parsedEndDate ];
             } else {
-                console.warn("invalid range value: ", range);
                 return null;
             }
         }
         return ranges;
     }
     function from(base, y, m, d) {
-        if (y === undefined) y = getYear(base);
-        if (m === undefined) m = getMonth(base);
-        if (d === undefined) d = getDate(base);
+        if (y === undefined) {
+            y = getYear(base);
+        }
+        if (m === undefined) {
+            m = getMonth(base);
+        }
+        if (d === undefined) {
+            d = getDate(base);
+        }
         return normalize(new Date(y, m, d));
     }
     function daysInMonth(month, year) {
@@ -2011,7 +2015,6 @@ if (!window.MutationObserver) {
         if (date > daysInNextMonth) {
             date = daysInNextMonth;
         }
-        console.log(new Date(d.getFullYear(), d.getMonth() + 1, date).toString());
         return new Date(d.getFullYear(), d.getMonth() + 1, date);
     }
     function prevMonth(d) {
@@ -2065,7 +2068,9 @@ if (!window.MutationObserver) {
         return relOffset(d, 0, 0, -1);
     }
     function dateMatches(d, matches) {
-        if (!matches) return;
+        if (!matches) {
+            return;
+        }
         matches = matches.length === undefined ? [ matches ] : matches;
         var foundMatch = false;
         matches.forEach(function(match) {
@@ -2117,7 +2122,9 @@ if (!window.MutationObserver) {
     }
     var CALENDAR_PROTOTYPE = Calendar.prototype;
     CALENDAR_PROTOTYPE.makeMonth = function(d) {
-        if (!isValidDateObj(d)) throw "Invalid view date!";
+        if (!isValidDateObj(d)) {
+            throw "Invalid view date!";
+        }
         var firstWeekday = this.firstWeekdayNum;
         var chosen = this.chosen;
         var labels = this.labels;
@@ -2152,13 +2159,14 @@ if (!window.MutationObserver) {
                 addClass(day, "today");
             }
             appendChild(week, day);
-            var oldDate = cDate;
             cDate = nextDay(cDate);
             if ((step + 1) % 7 === 0) {
                 appendChild(monthEl, week);
                 week = makeEl("div.week");
                 var done = getMonth(cDate) > month || getMonth(cDate) < month && getYear(cDate) > getYear(sDate);
-                if (done) break;
+                if (done) {
+                    break;
+                }
             }
         }
         return monthEl;
@@ -2325,7 +2333,9 @@ if (!window.MutationObserver) {
         this._callCustomRenderer();
     };
     CALENDAR_PROTOTYPE._callCustomRenderer = function() {
-        if (!this._customRenderFn) return;
+        if (!this._customRenderFn) {
+            return;
+        }
         if (this._renderRecursionFlag) {
             throw "Error: customRenderFn causes recursive loop of " + "rendering calendar; make sure your custom rendering " + "function doesn't modify attributes of the x-calendar that " + "would require a re-render!";
         }
@@ -2464,7 +2474,9 @@ if (!window.MutationObserver) {
             set: function(newLabelData) {
                 var oldLabelData = this.labels;
                 for (var labelType in oldLabelData) {
-                    if (!(labelType in newLabelData)) continue;
+                    if (!(labelType in newLabelData)) {
+                        continue;
+                    }
                     var oldLabel = this._labels[labelType];
                     var newLabel = newLabelData[labelType];
                     if (isArray(oldLabel)) {
@@ -2536,7 +2548,7 @@ if (!window.MutationObserver) {
             day.setAttribute("active", true);
         }
     }
-    function _onDragEnd(e) {
+    function _onDragEnd() {
         var xCalendars = xtag.query(document, "x-calendar");
         for (var i = 0; i < xCalendars.length; i++) {
             var xCalendar = xCalendars[i];
@@ -2611,7 +2623,9 @@ if (!window.MutationObserver) {
                     return;
                 }
                 e.preventDefault();
-                if (e.baseEvent) e.baseEvent.preventDefault();
+                if (e.baseEvent) {
+                    e.baseEvent.preventDefault();
+                }
                 _onDragStart(e.currentTarget, this);
             },
             touchmove: function(e) {
@@ -2638,7 +2652,7 @@ if (!window.MutationObserver) {
                 var day = this;
                 _onDragMove(xCalendar, day);
             },
-            "mouseout:delegate(.day)": function(e) {
+            "mouseout:delegate(.day)": function() {
                 var day = this;
                 day.removeAttribute("active");
             },
@@ -2801,9 +2815,13 @@ if (!window.MutationObserver) {
                     this.xtag.calObj.labels = newLabelData;
                     var labels = this.xtag.calObj.labels;
                     var prevControl = this.querySelector(".controls > .prev");
-                    if (prevControl) prevControl.textContent = labels.prev;
+                    if (prevControl) {
+                        prevControl.textContent = labels.prev;
+                    }
                     var nextControl = this.querySelector(".controls > .next");
-                    if (nextControl) nextControl.textContent = labels.next;
+                    if (nextControl) {
+                        nextControl.textContent = labels.next;
+                    }
                 }
             }
         },
@@ -2848,7 +2866,7 @@ if (!window.MutationObserver) {
         this.currIndex = -1;
         this._itemCap = undefined;
         this.itemCap = itemCap;
-        this._validatorFn = validatorFn ? validatorFn : function(x) {
+        this._validatorFn = validatorFn ? validatorFn : function() {
             return true;
         };
     }
@@ -3121,7 +3139,6 @@ if (!window.MutationObserver) {
         }
         _sanitizeCardAttrs(deck);
         if (transitionType === undefined) {
-            console.log("defaulting to none transition");
             transitionType = "none";
         }
         var isReverse;
@@ -3216,7 +3233,7 @@ if (!window.MutationObserver) {
             }
         },
         events: {
-            "show:delegate(x-card)": function(e) {
+            "show:delegate(x-card)": function() {
                 var card = this;
                 card.show();
             }
@@ -3326,7 +3343,6 @@ if (!window.MutationObserver) {
             },
             historyBack: function(progressType) {
                 var history = this.xtag.history;
-                var deck = this;
                 if (history.canUndo) {
                     history.backwards();
                     var newCard = history.currState;
@@ -3337,7 +3353,6 @@ if (!window.MutationObserver) {
             },
             historyForward: function(progressType) {
                 var history = this.xtag.history;
-                var deck = this;
                 if (history.canRedo) {
                     history.forwards();
                     var newCard = history.currState;
@@ -3481,11 +3496,13 @@ if (!window.MutationObserver) {
 (function() {
     function getLayoutElements(layout) {
         var first = layout.firstElementChild;
-        if (!first) return {
-            header: null,
-            section: null,
-            footer: null
-        };
+        if (!first) {
+            return {
+                header: null,
+                section: null,
+                footer: null
+            };
+        }
         var second = first.nextElementSibling;
         return {
             header: first.nodeName == "HEADER" ? first : null,
@@ -3507,8 +3524,12 @@ if (!window.MutationObserver) {
     function maxContent(layout, elements) {
         layout.setAttribute("content-maximizing", null);
         if (elements.section) {
-            if (elements.header) elements.section.style.marginTop = "-" + elements.header.getBoundingClientRect().height + "px";
-            if (elements.footer) elements.section.style.marginBottom = "-" + elements.footer.getBoundingClientRect().height + "px";
+            if (elements.header) {
+                elements.section.style.marginTop = "-" + elements.header.getBoundingClientRect().height + "px";
+            }
+            if (elements.footer) {
+                elements.section.style.marginBottom = "-" + elements.footer.getBoundingClientRect().height + "px";
+            }
         }
     }
     function minContent(layout, elements) {
@@ -3524,9 +3545,17 @@ if (!window.MutationObserver) {
             var target = event.target, layout = event.currentTarget;
             if (this.scrollhide && (target.parentNode == layout || xtag.matchSelector(target, layout.scrollTarget))) {
                 var now = target.scrollTop, buffer = layout.scrollBuffer, elements = getLayoutElements(layout), scroll = getLayoutScroll(layout, target);
-                if (now > scroll.last) scroll.min = Math.max(now - buffer, buffer); else if (now < scroll.last) scroll.max = Math.max(now + buffer, buffer);
+                if (now > scroll.last) {
+                    scroll.min = Math.max(now - buffer, buffer);
+                } else if (now < scroll.last) {
+                    scroll.max = Math.max(now + buffer, buffer);
+                }
                 if (!layout.maxcontent) {
-                    if (now > scroll.max && !layout.hasAttribute("content-maximized")) maxContent(layout, elements); else if (now < scroll.min) minContent(layout, elements);
+                    if (now > scroll.max && !layout.hasAttribute("content-maximized")) {
+                        maxContent(layout, elements);
+                    } else if (now < scroll.min) {
+                        minContent(layout, elements);
+                    }
                 }
                 scroll.last = now;
             }
@@ -3550,8 +3579,12 @@ if (!window.MutationObserver) {
                 if (layout.taphide && this.parentNode == layout) {
                     var elements = getLayoutElements(layout);
                     if (layout.hasAttribute("content-maximizing") || layout.hasAttribute("content-maximized")) {
-                        if (!layout.maxcontent) minContent(layout, elements);
-                    } else maxContent(layout, elements);
+                        if (!layout.maxcontent) {
+                            minContent(layout, elements);
+                        }
+                    } else {
+                        maxContent(layout, elements);
+                    }
                 }
             },
             "mouseover:delegate(section)": function(e) {
@@ -3602,7 +3635,11 @@ if (!window.MutationObserver) {
                 },
                 set: function(value) {
                     var elements = getLayoutElements(this);
-                    if (value) maxContent(this, elements); else if (!this.hasAttribute("content-maximizing")) minContent(this, elements);
+                    if (value) {
+                        maxContent(this, elements);
+                    } else if (!this.hasAttribute("content-maximizing")) {
+                        minContent(this, elements);
+                    }
                 }
             }
         }
@@ -3627,8 +3664,13 @@ if (!window.MutationObserver) {
     }
     function init(toSelected) {
         var slides = this.firstElementChild;
-        if (!slides || !slides.children.length || slides.tagName.toLowerCase() != "x-slides") return;
-        var children = xtag.toArray(slides.children), size = 100 / (children.length || 1), orient = this.getAttribute("orientation") || "x", style = orient == "x" ? [ "width", "height" ] : [ "height", "width" ];
+        if (!slides || !slides.children.length || slides.tagName.toLowerCase() != "x-slides") {
+            return;
+        }
+        var children = xtag.toArray(slides.children);
+        var size = 100 / (children.length || 1);
+        var orient = this.getAttribute("orientation") || "x";
+        var style = orient == "x" ? [ "width", "height" ] : [ "height", "width" ];
         slides.style[style[1]] = "100%";
         slides.style[style[0]] = children.length * 100 + "%";
         slides.style[transform] = "translate" + orient + "(0%)";
@@ -3639,7 +3681,9 @@ if (!window.MutationObserver) {
         });
         if (toSelected) {
             var selected = slides.querySelector("[selected]");
-            if (selected) slide(this, children.indexOf(selected) || 0);
+            if (selected) {
+                slide(this, children.indexOf(selected) || 0);
+            }
         }
     }
     xtag.register("x-slidebox", {
@@ -3698,12 +3742,16 @@ if (!window.MutationObserver) {
         lifecycle: {
             inserted: function() {
                 var ancestor = this.parentNode.parentNode;
-                if (ancestor.tagName.toLowerCase() == "x-slidebox") init.call(ancestor, true);
+                if (ancestor.tagName.toLowerCase() == "x-slidebox") {
+                    init.call(ancestor, true);
+                }
             },
-            created: function(e) {
+            created: function() {
                 if (this.parentNode) {
                     var ancestor = this.parentNode.parentNode;
-                    if (ancestor.tagName.toLowerCase() == "x-slidebox") init.call(ancestor, true);
+                    if (ancestor.tagName.toLowerCase() == "x-slidebox") {
+                        init.call(ancestor, true);
+                    }
                 }
             }
         }
@@ -3776,10 +3824,14 @@ if (!window.MutationObserver) {
         var sliderRect = slider.getBoundingClientRect();
         var thumbRect = thumb.getBoundingClientRect();
         var fraction = _rawValToFraction(slider, value);
-        var availableWidth = Math.max(sliderRect.width - thumbRect.width, 0);
+        var vertical = slider.vertical;
+        var sliderWidth = sliderRect[vertical ? "height" : "width"];
+        var thumbWidth = thumbRect[vertical ? "height" : "width"];
+        var availableWidth = Math.max(sliderWidth - thumbWidth, 0);
         var newThumbX = availableWidth * fraction;
-        var finalPercentage = newThumbX / sliderRect.width;
-        thumb.style.left = finalPercentage * 100 + "%";
+        var finalPercentage = newThumbX / sliderWidth;
+        thumb.style[vertical ? "left" : "top"] = 0;
+        thumb.style[vertical ? "top" : "left"] = finalPercentage * 100 + "%";
     }
     function _redraw(slider) {
         _positionThumb(slider, slider.value);
@@ -3788,9 +3840,12 @@ if (!window.MutationObserver) {
         var inputEl = slider.xtag.rangeInputEl;
         var inputOffsets = inputEl.getBoundingClientRect();
         var inputClickX = pageX - inputOffsets.left;
-        var oldValue = slider.value;
-        var newValue = _fractionToCorrectedVal(slider, inputClickX / inputOffsets.width);
-        slider.value = newValue;
+        var divideby = inputOffsets.width;
+        if (slider.vertical) {
+            divideby = inputOffsets.height;
+            inputClickX = pageY - inputOffsets.top;
+        }
+        slider.value = _fractionToCorrectedVal(slider, inputClickX / divideby);
         xtag.fireEvent(slider, "input");
         _redraw(slider);
     }
@@ -3999,6 +4054,14 @@ if (!window.MutationObserver) {
                     }
                 }
             },
+            vertical: {
+                attribute: {
+                    "boolean": true
+                },
+                set: function() {
+                    _redraw(this);
+                }
+            },
             max: {
                 attribute: {
                     selector: "input[type=range]"
@@ -4104,7 +4167,7 @@ if (!window.MutationObserver) {
             }
         },
         events: {
-            "tap:delegate(x-tabbar-tab)": function(e) {
+            "tap:delegate(x-tabbar-tab)": function() {
                 var activeTab = xtag.query(this.parentNode, "x-tabbar-tab[selected]");
                 if (activeTab.length) {
                     activeTab.forEach(function(t) {
@@ -4220,15 +4283,21 @@ if (!window.MutationObserver) {
 (function() {
     function setScope(toggle) {
         var form = toggle.xtag.inputEl.form;
-        if (form) toggle.removeAttribute("x-toggle-no-form"); else toggle.setAttribute("x-toggle-no-form", "");
+        if (form) {
+            toggle.removeAttribute("x-toggle-no-form");
+        } else {
+            toggle.setAttribute("x-toggle-no-form", "");
+        }
         toggle.xtag.scope = toggle.parentNode ? form || document : null;
     }
     function updateScope(scope) {
-        var names = {}, docSelector = scope == document ? "[x-toggle-no-form]" : "";
+        var names = {};
+        var docSelector = scope == document ? "[x-toggle-no-form]" : "";
         xtag.query(scope, "x-toggle[name]" + docSelector).forEach(function(toggle) {
             var name = toggle.name;
             if (name && !names[name]) {
-                var named = xtag.query(scope, 'x-toggle[name="' + name + '"]' + docSelector), type = named.length > 1 ? "radio" : "checkbox";
+                var named = xtag.query(scope, 'x-toggle[name="' + name + '"]' + docSelector);
+                var type = named.length > 1 ? "radio" : "checkbox";
                 named.forEach(function(toggle) {
                     if (toggle.xtag && toggle.xtag.inputEl) {
                         toggle.type = type;
@@ -4254,26 +4323,40 @@ if (!window.MutationObserver) {
         keyup: function(e) {
             shifted = e.shiftKey;
         },
-        "focus:delegate(x-toggle)": function(e) {
+        "focus:delegate(x-toggle)": function() {
             this.setAttribute("focus", "");
         },
-        "blur:delegate(x-toggle)": function(e) {
+        "blur:delegate(x-toggle)": function() {
             this.removeAttribute("focus");
         },
-        "tap:delegate(x-toggle)": function(e) {
+        "tap:delegate(x-toggle)": function() {
             if (shifted && this.group) {
-                var toggles = this.groupToggles, active = this.xtag.scope.querySelector('x-toggle[group="' + this.group + '"][active]');
+                var toggles = this.groupToggles;
+                var selector = 'x-toggle[group="' + this.group + '"][active]';
+                var active = this.xtag.scope.querySelector(selector);
                 if (active && this != active) {
-                    var self = this, state = active.checked, index = toggles.indexOf(this), activeIndex = toggles.indexOf(active), minIndex = Math.min(index, activeIndex), maxIndex = Math.max(index, activeIndex);
+                    var self = this;
+                    var state = active.checked;
+                    var index = toggles.indexOf(this);
+                    var activeIndex = toggles.indexOf(active);
+                    var minIndex = Math.min(index, activeIndex);
+                    var maxIndex = Math.max(index, activeIndex);
                     toggles.slice(minIndex, maxIndex).forEach(function(toggler) {
-                        if (toggler != self) toggler.checked = state;
+                        if (toggler != self) {
+                            toggler.checked = state;
+                        }
                     });
                 }
             }
         },
-        "change:delegate(x-toggle)": function(e) {
-            var active = this.xtag.scope.querySelector('x-toggle[group="' + this.group + '"][active]');
-            this.checked = shifted && active && this != active ? active.checked : this.xtag.inputEl.checked;
+        "change:delegate(x-toggle)": function() {
+            var selector = 'x-toggle[group="' + this.group + '"][active]';
+            var active = this.xtag.scope.querySelector(selector);
+            if (shifted && active && this != active) {
+                this.checked = active.checked;
+            } else {
+                this.checked = this.xtag.inputEl.checked;
+            }
             if (this.group) {
                 this.groupToggles.forEach(function(toggle) {
                     toggle.active = false;
@@ -4294,8 +4377,12 @@ if (!window.MutationObserver) {
                 this.type = "checkbox";
                 setScope(this);
                 var name = this.getAttribute("name");
-                if (name) this.xtag.inputEl.name = this.getAttribute("name");
-                if (this.hasAttribute("checked")) this.checked = true;
+                if (name) {
+                    this.xtag.inputEl.name = this.getAttribute("name");
+                }
+                if (this.hasAttribute("checked")) {
+                    this.checked = true;
+                }
             },
             inserted: function() {
                 setScope(this);
@@ -4308,7 +4395,9 @@ if (!window.MutationObserver) {
                     }
                     this.setAttribute("no-box", true);
                 }
-                if (this.name) updateScope(this.xtag.scope);
+                if (this.name) {
+                    updateScope(this.xtag.scope);
+                }
             },
             removed: function() {
                 updateScope(this.xtag.scope);
@@ -4379,10 +4468,16 @@ if (!window.MutationObserver) {
                         var scopeSelector = this.xtag.scope == document ? "[x-toggle-no-form]" : "";
                         var selector = 'x-toggle[checked][name="' + name + '"]' + scopeSelector;
                         var previous = this.xtag.scope.querySelector(selector);
-                        if (previous) previous.removeAttribute("checked");
+                        if (previous) {
+                            previous.removeAttribute("checked");
+                        }
                     }
                     this.xtag.inputEl.checked = state;
-                    if (state) this.setAttribute("checked", ""); else this.removeAttribute("checked");
+                    if (state) {
+                        this.setAttribute("checked", "");
+                    } else {
+                        this.removeAttribute("checked");
+                    }
                 }
             },
             value: {
@@ -4579,7 +4674,7 @@ if (!window.MutationObserver) {
         }
     }
     PRESET_STYLE_LISTENERFNS = {
-        custom: function(tooltip, targetSelector) {
+        custom: function() {
             return [];
         },
         hover: function(tooltip, targetSelector) {
@@ -4642,7 +4737,7 @@ if (!window.MutationObserver) {
     };
     function mkGenericListeners(tooltip, targetSelector, eventName) {
         var createdListeners = [];
-        var targetTriggerFn = function(e) {
+        var targetTriggerFn = function() {
             var delegatedElem = this;
             tooltip.xtag._skipOuterClick = true;
             if (tooltip.hasAttribute("visible")) {
@@ -4774,12 +4869,16 @@ if (!window.MutationObserver) {
         var bounds = viewport;
         if (!tooltip.allowOverflow) {
             bounds = getRectIntersection(viewport, contextRect);
-            if (!bounds) bounds = contextRect;
+            if (!bounds) {
+                bounds = contextRect;
+            }
         }
         return bounds;
     }
     function _pickBestTooltipOrient(tooltip, validPositionDataList) {
-        if (validPositionDataList.length === 0) return null;
+        if (validPositionDataList.length === 0) {
+            return null;
+        }
         var bounds = _getTooltipConstraints(tooltip);
         var minX = bounds.left;
         var minY = bounds.top;
@@ -4825,7 +4924,9 @@ if (!window.MutationObserver) {
             _unforceDisplay(tooltip);
         }
         var bestOrient = _pickBestTooltipOrient(tooltip, validOrientDataList);
-        if (!bestOrient) bestOrient = "top";
+        if (!bestOrient) {
+            bestOrient = "top";
+        }
         tooltip.setAttribute(AUTO_ORIENT_ATTR, bestOrient);
         arrow.setAttribute(ARROW_DIR_ATTR, TIP_ORIENT_ARROW_DIR_MAP[bestOrient]);
         if (isValidOrientation(bestOrient) && bestOrient !== tmpOrient) {
@@ -4997,6 +5098,7 @@ if (!window.MutationObserver) {
             tooltip.xtag.lastTargetElem = triggerElem;
             xtag.skipTransition(tooltip, function() {
                 _positionTooltip(tooltip, triggerElem, targetOrient);
+                _forceDisplay(tooltip);
                 return _readyToShowFn;
             });
         } else {
@@ -5134,7 +5236,6 @@ if (!window.MutationObserver) {
                     return this.xtag._targetSelector;
                 },
                 set: function(newSelector) {
-                    var newTriggerElems = _selectorToElems(this, newSelector);
                     _updateTriggerListeners(this, newSelector, this.triggerStyle);
                     this.xtag._targetSelector = newSelector;
                 }
@@ -5156,7 +5257,7 @@ if (!window.MutationObserver) {
                     "boolean": true,
                     name: "allow-overflow"
                 },
-                set: function(allowsOverflow) {
+                set: function() {
                     this.refreshPosition();
                 }
             },

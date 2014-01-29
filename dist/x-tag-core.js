@@ -4,8 +4,7 @@ window.Platform = {};
 var logFlags = {};
 
 
-
-// DOMTokenList polyfill fir IE9
+// DOMTokenList polyfill for IE9
 (function () {
 
 if (typeof window.Element === "undefined" || "classList" in document.documentElement) return;
@@ -132,50 +131,9 @@ if (typeof WeakMap === 'undefined') {
  * license that can be found in the LICENSE file.
  */
 
-// SideTable is a weak map where possible. If WeakMap is not available the
-// association is stored as an expando property.
-var SideTable;
-// TODO(arv): WeakMap does not allow for Node etc to be keys in Firefox
-if (typeof WeakMap !== 'undefined' && navigator.userAgent.indexOf('Firefox/') < 0) {
-  SideTable = WeakMap;
-} else {
-  (function() {
-    var defineProperty = Object.defineProperty;
-    var counter = Date.now() % 1e9;
-
-    SideTable = function() {
-      this.name = '__st' + (Math.random() * 1e9 >>> 0) + (counter++ + '__');
-    };
-
-    SideTable.prototype = {
-      set: function(key, value) {
-        var entry = key[this.name];
-        if (entry && entry[0] === key)
-          entry[1] = value;
-        else
-          defineProperty(key, this.name, {value: [key, value], writable: true});
-      },
-      get: function(key) {
-        var entry;
-        return (entry = key[this.name]) && entry[0] === key ?
-            entry[1] : undefined;
-      },
-      delete: function(key) {
-        this.set(key, undefined);
-      }
-    }
-  })();
-}
-
-/*
- * Copyright 2012 The Polymer Authors. All rights reserved.
- * Use of this source code is goverened by a BSD-style
- * license that can be found in the LICENSE file.
- */
-
 (function(global) {
 
-  var registrationsTable = new SideTable();
+  var registrationsTable = new WeakMap();
 
   // We use setImmediate or postMessage for our future callback.
   var setImmediate = window.msSetImmediate;
@@ -708,22 +666,15 @@ if (typeof WeakMap !== 'undefined' && navigator.userAgent.indexOf('Firefox/') < 
 
   global.JsMutationObserver = JsMutationObserver;
 
+  // Provide unprefixed MutationObserver with native or JS implementation
+  if (!global.MutationObserver && global.WebKitMutationObserver)
+    global.MutationObserver = global.WebKitMutationObserver;
+
+  if (!global.MutationObserver)
+    global.MutationObserver = JsMutationObserver;
+
+
 })(this);
-
-/*
- * Copyright 2013 The Polymer Authors. All rights reserved.
- * Use of this source code is governed by a BSD-style
- * license that can be found in the LICENSE file.
- */
-
-if (!window.MutationObserver) {
-  window.MutationObserver = 
-      window.WebKitMutationObserver || 
-      window.JsMutationObserver;
-  if (!MutationObserver) {
-    throw new Error("no mutation observer support");
-  }
-}
 
 /*
  * Copyright 2013 The Polymer Authors. All rights reserved.
@@ -827,8 +778,10 @@ if (useNative) {
       // offer guidance)
       throw new Error('document.register: first argument (\'name\') must contain a dash (\'-\'). Argument provided was \'' + String(name) + '\'.');
     }
-    // record name
-    definition.name = name;
+    // elements may only be registered once
+    if (getRegisteredDefinition(name)) {
+      throw new Error('DuplicateDefinitionError: a type with name \'' + String(name) + '\' is already registered');
+    }
     // must have a prototype, default to an extension of HTMLElement
     // TODO(sjmiles): probably should throw if no prototype, check spec
     if (!definition.prototype) {
@@ -836,6 +789,8 @@ if (useNative) {
       // offer guidance)
       throw new Error('Options missing required prototype property');
     }
+    // record name
+    definition.name = name.toLowerCase();
     // ensure a lifecycle object so we don't have to null test it
     definition.lifecycle = definition.lifecycle || {};
     // build a list of ancestral custom elements (for native base detection)
@@ -851,7 +806,7 @@ if (useNative) {
     // overrides to implement attributeChanged callback
     overrideAttributeApi(definition.prototype);
     // 7.1.5: Register the DEFINITION with DOCUMENT
-    registerDefinition(name, definition);
+    registerDefinition(definition.name, definition);
     // 7.1.7. Run custom element constructor generation algorithm with PROTOTYPE
     // 7.1.8. Return the output of the previous step.
     definition.ctor = generateConstructor(definition);
@@ -867,7 +822,7 @@ if (useNative) {
   }
 
   function ancestry(extnds) {
-    var extendee = registry[extnds];
+    var extendee = getRegisteredDefinition(extnds);
     if (extendee) {
       return ancestry(extendee.extends).concat([extendee]);
     }
@@ -935,6 +890,8 @@ if (useNative) {
     if (definition.is) {
       element.setAttribute('is', definition.is);
     }
+    // remove 'unresolved' attr, which is a standin for :unresolved.
+    element.removeAttribute('unresolved');
     // make 'element' implement definition.prototype
     implement(element, definition);
     // flag as upgraded
@@ -998,28 +955,41 @@ if (useNative) {
     // overrides to implement callbacks
     // TODO(sjmiles): should support access via .attributes NamedNodeMap
     // TODO(sjmiles): preserves user defined overrides, if any
+    if (prototype.setAttribute._polyfilled) {
+      return;
+    }
     var setAttribute = prototype.setAttribute;
     prototype.setAttribute = function(name, value) {
       changeAttribute.call(this, name, value, setAttribute);
     }
     var removeAttribute = prototype.removeAttribute;
-    prototype.removeAttribute = function(name, value) {
-      changeAttribute.call(this, name, value, removeAttribute);
+    prototype.removeAttribute = function(name) {
+      changeAttribute.call(this, name, null, removeAttribute);
     }
+    prototype.setAttribute._polyfilled = true;
   }
 
+  // https://dvcs.w3.org/hg/webcomponents/raw-file/tip/spec/custom/
+  // index.html#dfn-attribute-changed-callback
   function changeAttribute(name, value, operation) {
     var oldValue = this.getAttribute(name);
     operation.apply(this, arguments);
-    if (this.attributeChangedCallback 
-        && (this.getAttribute(name) !== oldValue)) {
-      this.attributeChangedCallback(name, oldValue);
+    var newValue = this.getAttribute(name);
+    if (this.attributeChangedCallback
+        && (newValue !== oldValue)) {
+      this.attributeChangedCallback(name, oldValue, newValue);
     }
   }
 
   // element registry (maps tag names to definitions)
 
   var registry = {};
+
+  function getRegisteredDefinition(name) {
+    if (name) {
+      return registry[name.toLowerCase()];
+    }
+  }
 
   function registerDefinition(name, definition) {
     registry[name] = definition;
@@ -1034,7 +1004,7 @@ if (useNative) {
   function createElement(tag, typeExtension) {
     // TODO(sjmiles): ignore 'tag' when using 'typeExtension', we could
     // error check it, or perhaps there should only ever be one argument
-    var definition = registry[typeExtension || tag];
+    var definition = getRegisteredDefinition(typeExtension || tag);
     if (definition) {
       return new definition.ctor();
     }
@@ -1044,7 +1014,7 @@ if (useNative) {
   function upgradeElement(element) {
     if (!element.__upgraded__ && (element.nodeType === Node.ELEMENT_NODE)) {
       var type = element.getAttribute('is') || element.localName;
-      var definition = registry[type];
+      var definition = getRegisteredDefinition(type);
       return definition && upgrade(element, definition);
     }
   }
@@ -1284,7 +1254,7 @@ function removed(element) {
   }
 }
 
-function removed(element) {
+function _removed(element) {
   // TODO(sjmiles): temporary: do work on all custom elements so we can track
   // behavior even when callbacks not defined
   if (element.leftViewCallback || (element.__upgraded__ && logFlags.dom)) {
@@ -1337,16 +1307,6 @@ function watchRoot(root) {
   }
 }
 
-function filter(inNode) {
-  switch (inNode.localName) {
-    case 'style':
-    case 'script':
-    case 'template':
-    case undefined:
-      return true;
-  }
-}
-
 function handler(mutations) {
   //
   if (logFlags.dom) {
@@ -1369,7 +1329,7 @@ function handler(mutations) {
     if (mx.type === 'childList') {
       forEach(mx.addedNodes, function(n) {
         //logFlags.dom && console.log(n.localName);
-        if (filter(n)) {
+        if (!n.localName) {
           return;
         }
         // nodes added may need lifecycle management
@@ -1378,7 +1338,7 @@ function handler(mutations) {
       // removed nodes may need lifecycle management
       forEach(mx.removedNodes, function(n) {
         //logFlags.dom && console.log(n.localName);
-        if (filter(n)) {
+        if (!n.localName) {
           return;
         }
         removedNode(n);
@@ -1494,14 +1454,14 @@ CustomElements.parser = parser;
  * Use of this source code is governed by a BSD-style
  * license that can be found in the LICENSE file.
  */
-(function(){
+(function(scope){
 
 // bootstrap parsing
 function bootstrap() {
   // parse document
   CustomElements.parser.parse(document);
   // one more pass before register is 'live'
-  CustomElements.upgradeDocument(document);  
+  CustomElements.upgradeDocument(document);
   // choose async
   var async = window.Platform && Platform.endOfMicrotask ? 
     Platform.endOfMicrotask :
@@ -1525,20 +1485,30 @@ function bootstrap() {
 // CustomEvent shim for IE
 if (typeof window.CustomEvent !== 'function') {
   window.CustomEvent = function(inType) {
-     var e = document.createEvent('HTMLEvents');
-     e.initEvent(inType, true, true);
-     return e;
+    var e = document.createEvent('HTMLEvents');
+    e.initEvent(inType, true, true);
+    return e;
   };
 }
 
-if (document.readyState === 'complete') {
+// When loading at readyState complete time (or via flag), boot custom elements
+// immediately.
+// If relevant, HTMLImports must already be loaded.
+if (document.readyState === 'complete' || scope.flags.eager) {
   bootstrap();
+// When loading at readyState interactive time, bootstrap only if HTMLImports
+// are not pending. Also avoid IE as the semantics of this state are unreliable.
+} else if (document.readyState === 'interactive' && !window.attachEvent &&
+    (!window.HTMLImports || window.HTMLImports.ready)) {
+  bootstrap();
+// When loading at other readyStates, wait for the appropriate DOM event to 
+// bootstrap.
 } else {
   var loadEvent = window.HTMLImports ? 'HTMLImportsLoaded' : 'DOMContentLoaded';
   window.addEventListener(loadEvent, bootstrap);
 }
 
-})();
+})(window.CustomElements);
 
 (function () {
 
@@ -1641,9 +1611,11 @@ if (document.readyState === 'complete') {
   }
 
   function wrapMixin(tag, key, pseudo, value, original){
-    if (typeof original[key] != 'function') original[key] = value;
-    else {
-      original[key] = xtag.wrap(original[key], xtag.applyPseudos(pseudo, value, tag.pseudos));
+    var fn = original[key];
+    if (!(key in original)) original[key] = value;
+    else if (typeof original[key] == 'function') {
+      if (!fn.__mixins__) fn.__mixins__ = [];
+      fn.__mixins__.push(xtag.applyPseudos(pseudo, value, tag.pseudos));
     }
   }
 
@@ -1658,7 +1630,7 @@ if (document.readyState === 'complete') {
     }
     else {
       for (var zz in mixin){
-        wrapMixin(tag, zz + ':__mixin__(' + (uniqueMixinCount++) + ')', zz, mixin[zz], original);
+        original[zz + ':__mixin__(' + (uniqueMixinCount++) + ')'] = xtag.applyPseudos(zz, mixin[zz], tag.pseudos);
       }
     }
   }
@@ -1690,6 +1662,7 @@ if (document.readyState === 'complete') {
 
   function delegateAction(pseudo, event) {
     var match, target = event.target;
+    if (!target.tagName) return null;
     if (xtag.matchSelector(target, pseudo.value)) match = target;
     else if (xtag.matchSelector(target, pseudo.value + ' *')) {
       var parent = target.parentNode;
@@ -1775,7 +1748,7 @@ if (document.readyState === 'complete') {
     var key = z.split(':'), type = key[0];
     if (type == 'get') {
       key[0] = prop;
-      tag.prototype[prop].get = xtag.applyPseudos(key.join(':'), accessor[z], tag.pseudos);
+      tag.prototype[prop].get = xtag.applyPseudos(key.join(':'), accessor[z], tag.pseudos, accessor[z]);
     }
     else if (type == 'set') {
       key[0] = prop;
@@ -1789,7 +1762,7 @@ if (document.readyState === 'complete') {
       } : accessor[z] ? function(value){
         accessor[z].call(this, value);
         updateView(this, name, value);
-      } : null, tag.pseudos);
+      } : null, tag.pseudos, accessor[z]);
 
       if (attr) attr.setter = setter;
     }
@@ -1867,8 +1840,8 @@ if (document.readyState === 'complete') {
       var tag = xtag.tags[_name] = applyMixins(xtag.merge({}, xtag.defaultOptions, options));
 
       for (var z in tag.events) tag.events[z] = xtag.parseEvent(z, tag.events[z]);
-      for (z in tag.lifecycle) tag.lifecycle[z.split(':')[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos);
-      for (z in tag.methods) tag.prototype[z.split(':')[0]] = { value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos), enumerable: true };
+      for (z in tag.lifecycle) tag.lifecycle[z.split(':')[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos, tag.lifecycle[z]);
+      for (z in tag.methods) tag.prototype[z.split(':')[0]] = { value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos, tag.methods[z]), enumerable: true };
       for (z in tag.accessors) parseAccessor(tag, z);
 
       var ready = tag.lifecycle.created || tag.lifecycle.ready;
@@ -1880,7 +1853,7 @@ if (document.readyState === 'complete') {
           tag.mixins.forEach(function(mixin){
             if (xtag.mixins[mixin].events) xtag.addEvents(element, xtag.mixins[mixin].events);
           });
-          var output = ready ? ready.apply(this, toArray(arguments)) : null;
+          var output = ready ? ready.apply(this, arguments) : null;
           for (var name in tag.attributes) {
             var attr = tag.attributes[name],
                 hasAttr = this.hasAttribute(name);
@@ -1896,7 +1869,7 @@ if (document.readyState === 'complete') {
       };
 
       if (tag.lifecycle.inserted) tag.prototype.enteredViewCallback = { value: tag.lifecycle.inserted, enumerable: true };
-      if (tag.lifecycle.removed) tag.prototype.leftDocumentCallback = { value: tag.lifecycle.removed, enumerable: true };
+      if (tag.lifecycle.removed) tag.prototype.leftViewCallback = { value: tag.lifecycle.removed, enumerable: true };
       if (tag.lifecycle.attributeChanged) tag.prototype.attributeChangedCallback = { value: tag.lifecycle.attributeChanged, enumerable: true };
 
       var setAttribute = tag.prototype.setAttribute || HTMLElement.prototype.setAttribute;
@@ -2045,6 +2018,30 @@ if (document.readyState === 'complete') {
     },
     pseudos: {
       __mixin__: {},
+      mixins: {
+        onCompiled: function(fn, pseudo){
+          var mixins = pseudo.source.__mixins__;
+          if (mixins) switch (pseudo.value) {
+            case 'before': return function(){
+              var self = this,
+                  args = arguments;
+              mixins.forEach(function(m){
+                m.apply(self, args);
+              });
+              return fn.apply(self, args);
+            };
+            case 'after': case '': return function(){
+              var self = this,
+                  args = arguments;
+                  returns = fn.apply(self, args);
+              mixins.forEach(function(m){
+                m.apply(self, args);
+              });
+              return returns;
+            };
+          }
+        }
+      },
       keypass: keypseudo,
       keyfail: keypseudo,
       delegate: { action: delegateAction },
@@ -2074,7 +2071,7 @@ if (document.readyState === 'complete') {
 
     wrap: function (original, fn) {
       return function(){
-        var args = toArray(arguments),
+        var args = arguments,
             output = original.apply(this, args);
         fn.apply(this, args);
         return output;
@@ -2268,17 +2265,17 @@ if (document.readyState === 'complete') {
       var condition = event.condition;
       event.condition = function(e){
         var t = e.touches, tt = e.targetTouches;
-        return condition.apply(this, toArray(arguments));
+        return condition.apply(this, arguments);
       };
       var stack = xtag.applyPseudos(event.chain, fn, event._pseudos, event);
       event.stack = function(e){
         var t = e.touches, tt = e.targetTouches;
         var detail = e.detail || {};
-        if (!detail.__stack__) return stack.apply(this, toArray(arguments));
+        if (!detail.__stack__) return stack.apply(this, arguments);
         else if (detail.__stack__ == stack) {
           e.stopPropagation();
           e.cancelBubble = true;
-          return stack.apply(this, toArray(arguments));
+          return stack.apply(this, arguments);
         }
       };
       event.listener = function(e){
