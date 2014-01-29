@@ -1171,7 +1171,7 @@ x-tabbar > x-tabbar-tab > x-iconbutton:only-child {
 }
 
 x-toggle .x-toggle-content {
-  height: 22px;
+  min-height: 22px;
   line-height: 24px;
 }
 x-toggle .x-toggle-check {

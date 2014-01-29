@@ -418,19 +418,16 @@ if (typeof WeakMap === "undefined") {
             if (name.indexOf("-") < 0) {
                 throw new Error("document.register: first argument ('name') must contain a dash ('-'). Argument provided was '" + String(name) + "'.");
             }
-            if (getRegisteredDefinition(name)) {
-                throw new Error("DuplicateDefinitionError: a type with name '" + String(name) + "' is already registered");
-            }
+            definition.name = name;
             if (!definition.prototype) {
                 throw new Error("Options missing required prototype property");
             }
-            definition.name = name.toLowerCase();
             definition.lifecycle = definition.lifecycle || {};
             definition.ancestry = ancestry(definition.extends);
             resolveTagName(definition);
             resolvePrototypeChain(definition);
             overrideAttributeApi(definition.prototype);
-            registerDefinition(definition.name, definition);
+            registerDefinition(name, definition);
             definition.ctor = generateConstructor(definition);
             definition.ctor.prototype = definition.prototype;
             definition.prototype.constructor = definition.ctor;
@@ -440,7 +437,7 @@ if (typeof WeakMap === "undefined") {
             return definition.ctor;
         }
         function ancestry(extnds) {
-            var extendee = getRegisteredDefinition(extnds);
+            var extendee = registry[extnds];
             if (extendee) {
                 return ancestry(extendee.extends).concat([ extendee ]);
             }
@@ -536,11 +533,6 @@ if (typeof WeakMap === "undefined") {
             }
         }
         var registry = {};
-        function getRegisteredDefinition(name) {
-            if (name) {
-                return registry[name.toLowerCase()];
-            }
-        }
         function registerDefinition(name, definition) {
             registry[name] = definition;
         }
@@ -550,7 +542,7 @@ if (typeof WeakMap === "undefined") {
             };
         }
         function createElement(tag, typeExtension) {
-            var definition = getRegisteredDefinition(typeExtension || tag);
+            var definition = registry[typeExtension || tag];
             if (definition) {
                 return new definition.ctor();
             }
@@ -559,7 +551,7 @@ if (typeof WeakMap === "undefined") {
         function upgradeElement(element) {
             if (!element.__upgraded__ && element.nodeType === Node.ELEMENT_NODE) {
                 var type = element.getAttribute("is") || element.localName;
-                var definition = getRegisteredDefinition(type);
+                var definition = registry[type];
                 return definition && upgrade(element, definition);
             }
         }
@@ -952,10 +944,8 @@ if (typeof WeakMap === "undefined") {
         return source;
     }
     function wrapMixin(tag, key, pseudo, value, original) {
-        var fn = original[key];
-        if (!(key in original)) original[key] = value; else if (typeof original[key] == "function") {
-            if (!fn.__mixins__) fn.__mixins__ = [];
-            fn.__mixins__.push(xtag.applyPseudos(pseudo, value, tag.pseudos));
+        if (typeof original[key] != "function") original[key] = value; else {
+            original[key] = xtag.wrap(original[key], xtag.applyPseudos(pseudo, value, tag.pseudos));
         }
     }
     var uniqueMixinCount = 0;
@@ -968,7 +958,7 @@ if (typeof WeakMap === "undefined") {
             }
         } else {
             for (var zz in mixin) {
-                original[zz + ":__mixin__(" + uniqueMixinCount++ + ")"] = xtag.applyPseudos(zz, mixin[zz], tag.pseudos);
+                wrapMixin(tag, zz + ":__mixin__(" + uniqueMixinCount++ + ")", zz, mixin[zz], original);
             }
         }
     }
@@ -1064,7 +1054,7 @@ if (typeof WeakMap === "undefined") {
         var key = z.split(":"), type = key[0];
         if (type == "get") {
             key[0] = prop;
-            tag.prototype[prop].get = xtag.applyPseudos(key.join(":"), accessor[z], tag.pseudos, accessor[z]);
+            tag.prototype[prop].get = xtag.applyPseudos(key.join(":"), accessor[z], tag.pseudos);
         } else if (type == "set") {
             key[0] = prop;
             var setter = tag.prototype[prop].set = xtag.applyPseudos(key.join(":"), attr ? function(value) {
@@ -1077,7 +1067,7 @@ if (typeof WeakMap === "undefined") {
             } : accessor[z] ? function(value) {
                 accessor[z].call(this, value);
                 updateView(this, name, value);
-            } : null, tag.pseudos, accessor[z]);
+            } : null, tag.pseudos);
             if (attr) attr.setter = setter;
         } else tag.prototype[prop][z] = accessor[z];
     }
@@ -1141,9 +1131,9 @@ if (typeof WeakMap === "undefined") {
             delete options.prototype;
             var tag = xtag.tags[_name] = applyMixins(xtag.merge({}, xtag.defaultOptions, options));
             for (var z in tag.events) tag.events[z] = xtag.parseEvent(z, tag.events[z]);
-            for (z in tag.lifecycle) tag.lifecycle[z.split(":")[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos, tag.lifecycle[z]);
+            for (z in tag.lifecycle) tag.lifecycle[z.split(":")[0]] = xtag.applyPseudos(z, tag.lifecycle[z], tag.pseudos);
             for (z in tag.methods) tag.prototype[z.split(":")[0]] = {
-                value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos, tag.methods[z]),
+                value: xtag.applyPseudos(z, tag.methods[z], tag.pseudos),
                 enumerable: true
             };
             for (z in tag.accessors) parseAccessor(tag, z);
@@ -1156,7 +1146,7 @@ if (typeof WeakMap === "undefined") {
                     tag.mixins.forEach(function(mixin) {
                         if (xtag.mixins[mixin].events) xtag.addEvents(element, xtag.mixins[mixin].events);
                     });
-                    var output = ready ? ready.apply(this, arguments) : null;
+                    var output = ready ? ready.apply(this, toArray(arguments)) : null;
                     for (var name in tag.attributes) {
                         var attr = tag.attributes[name], hasAttr = this.hasAttribute(name);
                         if (hasAttr || attr.boolean) {
@@ -1325,32 +1315,6 @@ if (typeof WeakMap === "undefined") {
         },
         pseudos: {
             __mixin__: {},
-            mixins: {
-                onCompiled: function(fn, pseudo) {
-                    var mixins = pseudo.source.__mixins__;
-                    if (mixins) switch (pseudo.value) {
-                      case "before":
-                        return function() {
-                            var self = this, args = arguments;
-                            mixins.forEach(function(m) {
-                                m.apply(self, args);
-                            });
-                            return fn.apply(self, args);
-                        };
-
-                      case "after":
-                      case "":
-                        return function() {
-                            var self = this, args = arguments;
-                            returns = fn.apply(self, args);
-                            mixins.forEach(function(m) {
-                                m.apply(self, args);
-                            });
-                            return returns;
-                        };
-                    }
-                }
-            },
             keypass: keypseudo,
             keyfail: keypseudo,
             delegate: {
@@ -1378,7 +1342,7 @@ if (typeof WeakMap === "undefined") {
         toArray: toArray,
         wrap: function(original, fn) {
             return function() {
-                var args = arguments, output = original.apply(this, args);
+                var args = toArray(arguments), output = original.apply(this, args);
                 fn.apply(this, args);
                 return output;
             };
@@ -1532,16 +1496,16 @@ if (typeof WeakMap === "undefined") {
             var condition = event.condition;
             event.condition = function(e) {
                 var t = e.touches, tt = e.targetTouches;
-                return condition.apply(this, arguments);
+                return condition.apply(this, toArray(arguments));
             };
             var stack = xtag.applyPseudos(event.chain, fn, event._pseudos, event);
             event.stack = function(e) {
                 var t = e.touches, tt = e.targetTouches;
                 var detail = e.detail || {};
-                if (!detail.__stack__) return stack.apply(this, arguments); else if (detail.__stack__ == stack) {
+                if (!detail.__stack__) return stack.apply(this, toArray(arguments)); else if (detail.__stack__ == stack) {
                     e.stopPropagation();
                     e.cancelBubble = true;
-                    return stack.apply(this, arguments);
+                    return stack.apply(this, toArray(arguments));
                 }
             };
             event.listener = function(e) {
@@ -3420,6 +3384,16 @@ if (typeof WeakMap === "undefined") {
 })();
 
 (function() {
+    function reveal(e) {
+        var flipBox = e.currentTarget;
+        if (this.parentNode == flipBox) {
+            if (this.parentNode.firstElementChild == this) {
+                flipBox.flipped = false;
+            } else if (this.parentNode.lastElementChild == this) {
+                flipBox.flipped = true;
+            }
+        }
+    }
     xtag.register("x-flipbox", {
         lifecycle: {
             created: function() {
@@ -3435,27 +3409,13 @@ if (typeof WeakMap === "undefined") {
             }
         },
         events: {
-            "transitionend:delegate(*:first-child)": function(e) {
-                var frontCard = e.target;
-                var flipBox = frontCard.parentNode;
-                if (flipBox.nodeName.toLowerCase() === "x-flipbox") {
+            "transitionend:delegate(x-flipbox > *:first-child)": function(e) {
+                var flipBox = e.currentTarget;
+                if (this.parentNode == flipBox) {
                     xtag.fireEvent(flipBox, "flipend");
                 }
             },
-            "show:delegate(*:first-child)": function(e) {
-                var frontCard = e.target;
-                var flipBox = frontCard.parentNode;
-                if (flipBox.nodeName.toLowerCase() === "x-flipbox") {
-                    flipBox.flipped = false;
-                }
-            },
-            "show:delegate(*:last-child)": function(e) {
-                var backCard = e.target;
-                var flipBox = backCard.parentNode;
-                if (flipBox.nodeName.toLowerCase() === "x-flipbox") {
-                    flipBox.flipped = true;
-                }
-            }
+            "reveal:delegate(x-flipbox > *)": reveal
         },
         accessors: {
             direction: {
@@ -3464,12 +3424,15 @@ if (typeof WeakMap === "undefined") {
                     return this.xtag._direction;
                 },
                 set: function(value) {
+                    var self = this;
+                    xtag.skip(elem, before, after);
                     xtag.skipTransition(this.firstElementChild, function() {
-                        this.setAttribute("_anim-direction", value);
-                    }, this);
+                        self.setAttribute("_anim-direction", value);
+                        return function() {};
+                    });
                     xtag.skipTransition(this.lastElementChild, function() {
-                        this.setAttribute("_anim-direction", value);
-                    }, this);
+                        self.setAttribute("_anim-direction", value);
+                    });
                     this.xtag._direction = value;
                 }
             },
@@ -3698,9 +3661,9 @@ if (typeof WeakMap === "undefined") {
                     xtag.fireEvent(this, "slideend");
                 }
             },
-            "show:delegate(x-slide)": function(e) {
+            "reveal:delegate(x-slidebox > x-slides > x-slide)": function(e) {
                 var slide = e.target;
-                if (slide.parentNode.nodeName.toLowerCase() === "x-slides" && slide.parentNode.parentNode.nodeName.toLowerCase() === "x-slidebox") {
+                if (e.target.parentNode.parentNode == e.currentTarget) {
                     var slideWrap = slide.parentNode;
                     var box = slideWrap.parentNode;
                     var slides = xtag.query(slideWrap, "x-slide");
